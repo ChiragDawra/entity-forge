@@ -1,0 +1,17 @@
+# Python 3.11+ (developed on 3.12). All licenses permissive (MIT/BSD/Apache/ISC).
+numpy==2.5.3
+scipy==1.18.1
+polars==1.44.2
+lightgbm==4.7.0          # macOS: brew install libomp
+rapidfuzz==3.14.6
+sparse-dot-topn==1.2.0
+anyascii==0.3.3
+
+# notebooks
+jupyterlab==4.6.4
+ipykernel==7.3.0
+nbformat==5.11.1
+nbconvert==7.17.1
+
+# tests
+pytest==9.1.1
