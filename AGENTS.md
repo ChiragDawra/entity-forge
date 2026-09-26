@@ -46,7 +46,14 @@ Keep rejected experiments in the log.
 ## Running
 
 ```bash
-EF_DEV_MODE=1 bash scripts/run_notebooks.sh   # smoke test on a small slice
-bash scripts/run_notebooks.sh                 # full run (see docs/SAGEMAKER.md)
+bash scripts/run_notebooks.sh --dev      # smoke test on a small slice
+bash scripts/run_notebooks.sh            # full run / resume (see docs/SAGEMAKER.md)
+bash scripts/run_notebooks.sh --status   # checkpoint state
 pytest -q
 ```
+
+Memory rules: never `read_parquet` a whole candidate/feature/score table; use
+`scan_parquet` + filters/streaming group-bys or iterate parts. New per-row work
+goes into a part loop. Anything whose result depends on other S1s (target
+competition) must come from a whole-country aggregate, with a chunked-vs-whole
+equivalence test. Bump `stages.VERSIONS[stage]` when a stage's output semantics change.

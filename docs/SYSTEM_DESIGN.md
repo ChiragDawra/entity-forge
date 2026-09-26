@@ -83,7 +83,33 @@ output/matching_results.tsv, output/candidate_pairs.tsv → official validator �
 | design around an 8 GB laptop | defaults for a 64 GB+ box; `dev_mode` for laptops | requirement: best model, trained on SageMaker |
 | scripts | numbered notebooks over a tested package | requirement: Jupyter format |
 
-## 5. Invariants (asserted in code)
+## 5. Execution model: bounded memory, checkpoints, resume
+
+The full data (396M raw candidate rows, ~236M pruned pairs) never fits in RAM on
+the 32 GB reference machine (a raw US partition alone is ~8 GB as a DataFrame),
+so every stage streams:
+
+| Stage | How memory stays bounded |
+|---|---|
+| retrieval | one channel's vectors in RAM at a time; vectors spilled to disk; transposed target matrix *replaces* the row-major one during search; union and exact cosines computed per S1 range; parts streamed into one file |
+| vectorization | TF-IDF built in 500k-row chunks (document frequencies accumulated per chunk) |
+| stage-0 pruning | per-target statistics (count, max cosine per channel) from one streaming group-by; then S1-range chunks |
+| features | per-target competition statistics (count, top-8 `cos_both`, max `cos_addr`/`cos_name`) from one streaming group-by; one feature part per pruned part |
+| training | S1-grouped sample capped by the profile's row budget; one LightGBM `Dataset`, folds via `Dataset.subset` (no per-fold matrix copies) |
+| scoring / stage 2 / test | part by part; stage-2 set context from streaming group-bys over stage-1 scores |
+| decision / submission | only pairs with p ≥ 0.01 are materialized; `candidate_pairs.tsv` is streamed part by part |
+
+Chunked computations are proven equal to whole-partition computations by
+`tests/test_retrieval_equivalence.py` and `tests/test_streaming_equivalence.py`;
+the new retrieval reproduced the original dev candidates byte for byte (EXP-008).
+
+Checkpoints (`checkpoints.py`): every artifact gets a manifest (stage, key,
+semantic config hash, rows, schema, file sizes, timestamp) after it is complete.
+Part files are written atomically, and `_PLAN.json` pins part boundaries so a
+resume reuses them. Legacy `norm/` and `candidates_raw/` files are validated and
+adopted. `pipeline.py` runs each stage in its own process and skips valid work.
+
+## 6. Invariants (asserted in code)
 
 1. Every test S1 appears exactly once in both output files (empty lists allowed).
 2. Predicted matches ⊆ candidate pairs.
@@ -92,7 +118,7 @@ output/matching_results.tsv, output/candidate_pairs.tsv → official validator �
 5. Train and test share the same code path; the feature schema is saved with every model and checked on load.
 6. Folds are grouped by S1 id (deterministic hash); early stopping never uses the out-of-fold fold.
 
-## 6. Fair play
+## 7. Fair play
 
 No external data, geocoders, gazetteers or APIs. Every dictionary is
 hand-written in `dictionaries.py`. Libraries: Polars, NumPy, SciPy, RapidFuzz

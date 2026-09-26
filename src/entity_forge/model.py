@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import lightgbm as lgb
@@ -25,7 +26,7 @@ DEFAULT_PARAMS: dict = {
     "bagging_freq": 1,
     "lambda_l2": 1.0,
     "max_bin": 127,
-    "num_threads": 8,
+    "num_threads": 0,  # 0 = OpenMP default, capped by OMP_NUM_THREADS (resources.configure_threads)
     "seed": 13,
     "deterministic": True,
     "verbose": -1,
@@ -92,15 +93,38 @@ def train(
     return booster
 
 
-def predict(booster: lgb.Booster, frame: pl.DataFrame, columns: list[str]) -> np.ndarray:
+def train_on_dataset(
+    params: dict,
+    dtrain: lgb.Dataset,
+    dvalid: lgb.Dataset | None,
+    rounds: int,
+    early_stopping: int = 40,
+) -> lgb.Booster:
+    """Train on prebuilt (possibly ``Dataset.subset``) datasets: no feature-matrix copies."""
+    params = {**DEFAULT_PARAMS, **params}
+    callbacks = [lgb.log_evaluation(100)]
+    valid_sets = []
+    if dvalid is not None:
+        valid_sets = [dvalid]
+        callbacks.append(lgb.early_stopping(early_stopping, verbose=False))
+    booster = lgb.train(params, dtrain, num_boost_round=rounds, valid_sets=valid_sets, callbacks=callbacks)
+    log.info("trained %d rounds", booster.best_iteration or booster.current_iteration())
+    return booster
+
+
+def predict(booster: lgb.Booster, frame: pl.DataFrame, columns: list[str], n_threads: int = 0) -> np.ndarray:
     it = booster.best_iteration or None
-    return booster.predict(to_matrix(frame, columns), num_iteration=it).astype(np.float32)
+    kwargs = {"num_threads": n_threads} if n_threads else {}
+    return booster.predict(to_matrix(frame, columns), num_iteration=it, **kwargs).astype(np.float32)
 
 
 def save(booster: lgb.Booster, columns: list[str], path: Path) -> None:
+    """Write model + feature list atomically (a crash never leaves a half model)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    booster.save_model(str(path), num_iteration=booster.best_iteration or None)
+    tmp = path.with_name(path.name + ".tmp")
+    booster.save_model(str(tmp), num_iteration=booster.best_iteration or None)
     path.with_suffix(".features.json").write_text(json.dumps(columns))
+    os.replace(tmp, path)
 
 
 def load(path: Path) -> tuple[lgb.Booster, list[str]]:

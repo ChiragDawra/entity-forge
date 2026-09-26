@@ -1,14 +1,16 @@
-"""Run settings shared by every notebook.
+"""Run settings shared by every notebook and the pipeline runner.
 
-Defaults target a full-size training machine (e.g. SageMaker ml.r5.4xlarge or
-any 64 GB+ box). Every field can be overridden with an ``EF_<FIELD>``
-environment variable, so the same notebooks run unchanged on a laptop, a
-friend's machine or SageMaker.
+Precedence: dataclass defaults < resource profile (``EF_PROFILE``, auto-detected
+from RAM) < ``EF_<FIELD>`` environment variables < explicit ``overrides``.
+
+Memory-heavy knobs default to 0, meaning "take it from the profile" (see
+``resources.PROFILES``: 16gb / 32gb / 64gb). Everything that changes *results*
+(top-K per channel, candidate cap, folds, seeds) is independent of the profile,
+so the same candidates are produced on any machine; only speed and peak RAM change.
 
 ``dev_mode`` samples a small, consistent slice of the data (a fraction of S1
 plus a fraction of distractor targets) into *separate* ``*_dev`` directories,
-so an end-to-end smoke test fits on an 8 GB laptop without touching real
-artifacts.
+so an end-to-end smoke test fits on a laptop without touching real artifacts.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
+
+from .resources import cpu_count, resolve_profile
 
 
 def _find_root() -> Path:
@@ -34,11 +38,10 @@ class Settings:
     output_dir: Path = Path("output")
     team_name: str = "entity_forge"
 
-    n_threads: int = os.cpu_count() or 8
     seed: int = 42
     n_folds: int = 5
 
-    # Candidate generation: top-K per channel (see stages.make_channels, EXP-002..005).
+    # Candidate generation: top-K per channel (see stages.make_channels, EXP-002..006).
     top_k_addr: int = 40
     top_k_both: int = 40
     top_k_cross: int = 20
@@ -47,10 +50,19 @@ class Settings:
     top_k_translit: int = 20
     # Stage-0 pruning: keep this many union candidates per S1 (measured in notebook 02).
     max_candidates: int = 60
-    stage0_train_frac: float = 0.15
+    stage0_train_frac: float = 0.15  # upper bound; stage0_max_rows also caps it
 
-    # Rows per chunk when computing pair features.
-    feature_chunk: int = 3_000_000
+    # Resources (0 = from the profile; see resources.py).
+    profile: str = "auto"
+    n_threads: int = 0
+    retrieval_chunk: int = 0
+    candidate_chunk_rows: int = 0
+    feature_chunk: int = 0
+    stage0_max_rows: int = 0
+    stage1_max_rows: int = 0
+    stage2_max_rows: int = 0
+    min_free_gb: float = 0.0
+    min_free_disk_gb: float = 5.0
 
     # Smoke-test mode.
     dev_mode: bool = False
@@ -61,15 +73,23 @@ class Settings:
         for name in ("data_dir", "work_dir", "output_dir"):
             p = Path(getattr(self, name))
             object.__setattr__(self, name, p if p.is_absolute() else self.root / p)
+        prof = resolve_profile(self.profile)
+        object.__setattr__(self, "profile", prof.name)
+        if not self.n_threads:
+            object.__setattr__(self, "n_threads", cpu_count())
+        for name in ("retrieval_chunk", "candidate_chunk_rows", "feature_chunk", "stage0_max_rows",
+                     "stage1_max_rows", "stage2_max_rows", "min_free_gb"):
+            if not getattr(self, name):
+                object.__setattr__(self, name, getattr(prof, name))
 
     @classmethod
     def from_env(cls, **overrides) -> "Settings":
-        """Build settings from defaults < ``EF_*`` environment variables < ``overrides``."""
+        """Build settings from defaults < profile < ``EF_*`` environment variables < ``overrides``."""
         types = {f.name: f.type for f in fields(cls)}
         values: dict = {}
         for name, typ in types.items():
             raw = os.environ.get(f"EF_{name.upper()}")
-            if raw is None:
+            if raw is None or raw == "":
                 continue
             if typ == "bool":
                 values[name] = raw.lower() in ("1", "true", "yes")
@@ -83,7 +103,7 @@ class Settings:
                 values[name] = raw
         values.update(overrides)
         s = cls(**values)
-        if s.dev_mode:
+        if s.dev_mode and not s.work_dir.name.endswith("_dev"):
             s = replace(
                 s,
                 work_dir=s.work_dir.with_name(s.work_dir.name + "_dev"),
@@ -91,7 +111,17 @@ class Settings:
             )
         return s
 
+    def describe(self) -> str:
+        return (
+            f"profile={self.profile} threads={self.n_threads} retrieval_chunk={self.retrieval_chunk} "
+            f"candidate_chunk_rows={self.candidate_chunk_rows} feature_chunk={self.feature_chunk} "
+            f"stage0/1/2_max_rows={self.stage0_max_rows}/{self.stage1_max_rows}/{self.stage2_max_rows} "
+            f"min_free_gb={self.min_free_gb} dev_mode={self.dev_mode} work_dir={self.work_dir}"
+        )
+
     # Layout ---------------------------------------------------------------
+    # File paths are single Parquet files; directory paths hold part-*.parquet
+    # files plus a _MANIFEST.json written when the partition is complete.
 
     def raw(self, split: str, source: int) -> Path:
         return self.data_dir / split / f"{split}_source{source}.tsv"
@@ -107,10 +137,20 @@ class Settings:
         return self.work_dir / "candidates_raw" / split / f"{safe_name(ckey)}.parquet"
 
     def candidates(self, split: str, ckey: str) -> Path:
-        return self.work_dir / "candidates" / split / f"{safe_name(ckey)}.parquet"
+        """Pruned candidates (dir of parts)."""
+        return self.work_dir / "candidates" / split / safe_name(ckey)
 
     def features(self, split: str, ckey: str) -> Path:
-        return self.work_dir / "features" / split / f"{safe_name(ckey)}.parquet"
+        """Stage-1 features (dir of parts, 1:1 with pruned candidate parts)."""
+        return self.work_dir / "features" / split / safe_name(ckey)
+
+    def stage2_features(self, ckey: str) -> Path:
+        """Stage-2 features for train (dir of parts)."""
+        return self.work_dir / "stage2_features" / "train" / safe_name(ckey)
+
+    def scores(self, split: str, stage: int, ckey: str) -> Path:
+        """Per-pair scores (dir of parts): q, t, [label], p1[, p]."""
+        return self.work_dir / "scores" / split / f"stage{stage}" / safe_name(ckey)
 
     @property
     def stage0_model(self) -> Path:
@@ -119,9 +159,6 @@ class Settings:
     def model(self, stage: int, fold: int) -> Path:
         return self.work_dir / "models" / f"stage{stage}_fold{fold}.txt"
 
-    def scores(self, split: str, stage: int) -> Path:
-        return self.work_dir / "scores" / f"{split}_stage{stage}.parquet"
-
     @property
     def decision_file(self) -> Path:
         return self.work_dir / "models" / "decision.json"
@@ -129,6 +166,15 @@ class Settings:
     @property
     def reports(self) -> Path:
         return self.work_dir / "reports"
+
+    @property
+    def tmp(self) -> Path:
+        """Disposable scratch space (safe to delete when no run is active)."""
+        return self.work_dir / "tmp"
+
+    @property
+    def logs(self) -> Path:
+        return self.work_dir / "logs"
 
 
 def safe_name(ckey: str) -> str:

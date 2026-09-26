@@ -62,7 +62,9 @@ def _set_overlap(a: pl.Expr, b: pl.Expr, prefix: str) -> list[pl.Expr]:
     ]
 
 
-def pair_features(pairs: pl.DataFrame, queries: pl.DataFrame, targets: pl.DataFrame) -> pl.DataFrame:
+def pair_features(
+    pairs: pl.DataFrame, queries: pl.DataFrame, targets: pl.DataFrame, workers: int = -1
+) -> pl.DataFrame:
     """Similarity features for ``pairs`` (columns ``q``, ``t`` index the frames).
 
     ``queries``/``targets`` must contain ``RECORD_COLUMNS``; row position is the
@@ -72,7 +74,7 @@ def pair_features(pairs: pl.DataFrame, queries: pl.DataFrame, targets: pl.DataFr
     tf = with_derived(targets[pairs["t"].to_numpy()])
 
     scores = {
-        name: process.cpdist(qf[col].to_list(), tf[col].to_list(), scorer=scorer, workers=-1,
+        name: process.cpdist(qf[col].to_list(), tf[col].to_list(), scorer=scorer, workers=workers,
                              dtype=np.float32) * np.float32(scale)
         for name, col, scorer, scale in _STRING_SCORERS
     }
@@ -126,41 +128,62 @@ def pair_features(pairs: pl.DataFrame, queries: pl.DataFrame, targets: pl.DataFr
 
 
 _CONTEXT_SCORES: tuple[str, ...] = ("cos_both", "cos_name", "cos_addr")
+T_TOP = 8  # competing-S1 scores kept per target for rank / margin features
 
 
-def context_features(cands: pl.DataFrame) -> pl.DataFrame:
-    """Query-context and target-competition features over a *whole* population.
+def target_context(source: pl.LazyFrame | pl.DataFrame) -> pl.DataFrame:
+    """Per-target competition statistics over a *whole* country's candidates.
 
-    ``cands`` must contain every candidate pair of the S1 population being
-    scored (one country), because target competition looks across S1 entities.
+    Streaming group-by: memory is bounded by the number of distinct targets.
     """
+    agg = (
+        source.lazy()
+        .group_by("t")
+        .agg(
+            pl.len().cast(pl.Int16).alias("t_n_q"),
+            pl.col("cos_both").top_k(T_TOP).alias("_tops"),
+            pl.col("cos_addr").max().alias("_tmax_addr"),
+            pl.col("cos_name").max().alias("_tmax_name"),
+        )
+        .collect(engine="streaming")
+    )
+    tops = agg["_tops"].list.sort(descending=True)
+    return agg.drop("_tops").with_columns(
+        [tops.list.get(i, null_on_oob=True).alias(f"_top{i}") for i in range(T_TOP)]
+    )
+
+
+def context_features(cands: pl.DataFrame, t_ctx: pl.DataFrame | None = None) -> pl.DataFrame:
+    """Query-context and target-competition features for complete S1 groups.
+
+    Query context only looks inside one S1, so any chunk of whole S1s is exact.
+    Target competition needs every S1 that retrieved the target: pass ``t_ctx``
+    from ``target_context`` over the whole country (defaults to ``cands`` itself).
+    ``t_rank_cos_both`` = 1 + number of competing S1s with a strictly higher
+    ``cos_both`` (capped at ``T_TOP + 1``).
+    """
+    if t_ctx is None:
+        t_ctx = target_context(cands)
     exprs: list[pl.Expr] = [pl.len().over("q").cast(pl.Int16).alias("q_n_cands")]
     for s in _CONTEXT_SCORES:
         exprs += [
             (pl.col(s) - pl.col(s).max().over("q")).alias(f"q_gap_{s}"),
             pl.col(s).rank("ordinal", descending=True).over("q").cast(pl.Int16).alias(f"q_rank_{s}"),
         ]
-    exprs += [
-        pl.len().over("t").cast(pl.Int16).alias("t_n_q"),
-        pl.col("cos_both").rank("ordinal", descending=True).over("t").cast(pl.Int16).alias("t_rank_cos_both"),
-        (pl.col("cos_both") - pl.col("cos_both").max().over("t")).alias("t_gap_cos_both"),
-        (pl.col("cos_addr") - pl.col("cos_addr").max().over("t")).alias("t_gap_cos_addr"),
-        (pl.col("cos_name") - pl.col("cos_name").max().over("t")).alias("t_gap_cos_name"),
-    ]
-    out = cands.with_columns(exprs)
-    # Margin over the best *other* S1 competing for the same target.
-    second = (
-        out.filter(pl.col("t_rank_cos_both") <= 2)
-        .group_by("t")
-        .agg(pl.col("cos_both").sort(descending=True).get(1, null_on_oob=True).alias("_second"))
+    out = cands.with_columns(exprs).join(t_ctx, on="t", how="left", maintain_order="left")
+    higher = [(pl.col(f"_top{i}") > pl.col("cos_both")).fill_null(False).cast(pl.Int16) for i in range(T_TOP)]
+    best = pl.col("cos_both") >= pl.col("_top0")
+    out = out.with_columns(
+        (1 + pl.sum_horizontal(higher)).cast(pl.Int16).alias("t_rank_cos_both"),
+        (pl.col("cos_both") - pl.col("_top0")).alias("t_gap_cos_both"),
+        (pl.col("cos_addr") - pl.col("_tmax_addr")).alias("t_gap_cos_addr"),
+        (pl.col("cos_name") - pl.col("_tmax_name")).alias("t_gap_cos_name"),
+        pl.when(best)
+        .then(pl.col("cos_both") - pl.col("_top1").fill_null(0.0))
+        .otherwise(pl.col("cos_both") - pl.col("_top0"))
+        .alias("t_margin_cos_both"),
     )
-    out = out.join(second, on="t", how="left").with_columns(
-        pl.when(pl.col("t_rank_cos_both") == 1)
-        .then(pl.col("cos_both") - pl.col("_second").fill_null(0.0))
-        .otherwise(pl.col("t_gap_cos_both"))
-        .alias("t_margin_cos_both")
-    )
-    return out.drop("_second")
+    return out.drop([c for c in out.columns if c.startswith("_t")])
 
 
 def name_frequency(frames: list[pl.DataFrame]) -> pl.DataFrame:

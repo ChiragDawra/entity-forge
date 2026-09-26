@@ -144,27 +144,46 @@ class FittedBlock:
     idf: np.ndarray
 
 
-def fit_blocks(corpus: pl.DataFrame, specs: list[FieldSpec], max_df_frac: float) -> list[FittedBlock]:
-    """Learn per-block IDF on the target corpus."""
+ROW_CHUNK = 500_000
+
+
+def fit_blocks(corpus: pl.DataFrame, specs: list[FieldSpec], max_df_frac: float,
+               chunk_rows: int = ROW_CHUNK) -> list[FittedBlock]:
+    """Learn per-block IDF on the target corpus (document frequencies accumulated per chunk)."""
     n = corpus.height
     max_df = max(50, int(max_df_frac * n))
     fitted = []
     for spec in specs:
-        counts = term_counts(corpus[spec.column], spec.kind, texts2=_second(corpus, spec))
-        fitted.append(FittedBlock(spec, idf_weights(document_frequency(counts), n, max_df)))
-        del counts
+        df = np.zeros(1 << N_BITS, dtype=np.int64)
+        for start in range(0, n, chunk_rows):
+            part = corpus.slice(start, chunk_rows)
+            counts = term_counts(part[spec.column], spec.kind, chunk_rows, texts2=_second(part, spec))
+            df += np.bincount(counts.indices, minlength=counts.shape[1])
+            del counts
+        fitted.append(FittedBlock(spec, idf_weights(df, n, max_df)))
     return fitted
 
 
-def transform(frame: pl.DataFrame, blocks: list[FittedBlock]) -> sp.csr_matrix:
-    """Weighted concatenation of per-block TF-IDF vectors, L2-normalized overall."""
-    parts = []
-    for block in blocks:
-        counts = term_counts(frame[block.spec.column], block.spec.kind, texts2=_second(frame, block.spec))
-        vec = tfidf(counts, block.idf)
-        parts.append(vec * np.float32(np.sqrt(block.spec.weight)))
-    mat = sp.hstack(parts, format="csr") if len(parts) > 1 else parts[0]
-    return _l2_rows(mat)
+def transform(frame: pl.DataFrame, blocks: list[FittedBlock], chunk_rows: int = ROW_CHUNK) -> sp.csr_matrix:
+    """Weighted concatenation of per-block TF-IDF vectors, L2-normalized overall.
+
+    Built in row chunks so peak memory is about one chunk plus the result,
+    instead of several full-size intermediate copies.
+    """
+    rows = []
+    for start in range(0, frame.height, chunk_rows):
+        part = frame.slice(start, chunk_rows)
+        vecs = []
+        for block in blocks:
+            counts = term_counts(part[block.spec.column], block.spec.kind, chunk_rows,
+                                 texts2=_second(part, block.spec))
+            vecs.append(tfidf(counts, block.idf) * np.float32(np.sqrt(block.spec.weight)))
+        mat = sp.hstack(vecs, format="csr") if len(vecs) > 1 else vecs[0]
+        rows.append(_l2_rows(mat))
+    if not rows:
+        width = (1 << N_BITS) * max(len(blocks), 1)
+        return sp.csr_matrix((0, width), dtype=np.float32)
+    return sp.vstack(rows, format="csr") if len(rows) > 1 else rows[0]
 
 
 def rowwise_dot(

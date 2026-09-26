@@ -6,6 +6,7 @@ lightgbm==4.7.0          # macOS: brew install libomp
 rapidfuzz==3.14.6
 sparse-dot-topn==1.2.0
 anyascii==0.3.3
+psutil==7.2.2            # RAM monitoring / memory guards
 
 # notebooks
 jupyterlab==4.6.4

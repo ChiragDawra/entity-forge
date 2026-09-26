@@ -133,3 +133,111 @@ Engineering issues found and fixed by this run:
    2 % sample kept 100 %) → proper xor-shift-multiply mixing, with a test.
 3. Submission rows now come from the raw `test_source1.tsv`, so every S1 always
    gets a row.
+
+## EXP-008 · Memory-bounded, checkpointed pipeline (32 GB target)
+
+**Why.** On a 4 vCPU / 32 GB SageMaker instance, stages 01–02 finished
+(396M raw candidate rows) but the kernel died in notebook 02. The old code
+loaded whole candidate tables (`read_parquet`) and ran windows and filtered
+copies on them. The US train partition alone is 121M rows ≈ 8 GB as a
+DataFrame before any window. Retrieval also kept all six channels' sparse
+matrices alive.
+
+**Measured per-row costs (dev slice)** used to size profiles and disk checks:
+
+| artifact | disk B/row | RAM B/row |
+|---|---|---|
+| normalized record | 91 | 220 |
+| raw candidate | 22 | 68 |
+| pruned candidate | 26 | 72 |
+| stage-1 features | 73 | 206 |
+| stage-2 features | 104 | 274 |
+
+**Correctness of the refactor.**
+
+| check | result |
+|---|---|
+| streamed retrieval vs original in-memory algorithm (dev train/india, 1.84M pairs) | identical: same pairs, ranks, ids; cosines equal (≤1e-6) |
+| same, vs the candidate file produced by the original dev run | byte-identical frame |
+| chunked vs whole stage-0 features, context features, stage-2 aggregates | identical (unit tests with ties) |
+| pruned candidate recall (dev) | India 0.99339 / US 0.99602, identical to before |
+| OOF macro F0.5 (dev), stage-1 rule / final | 0.97956 / **0.98015** (before: 0.97950 / 0.98000) |
+| official validator (`--check-ids`) | PASS |
+
+`t_rank_cos_both` was redefined as 1 + number of competing S1s with a strictly
+higher `cos_both` (ties share a rank, capped at 9). It now comes from a bounded
+per-target aggregate instead of a whole-table window. No model had been
+trained on the old definition.
+
+**Dev run on the new entry point** (`bash scripts/run_notebooks.sh --dev`,
+Apple M1, 8 GB RAM, `16gb` profile):
+
+| stage | time | peak RSS |
+|---|---|---|
+| normalize | 90 s | 1.2 GB |
+| candidates (5 legacy files validated + adopted) | 3 s | 0.2 GB |
+| prune (stage-0 training + 5 partitions) | 24 s | 1.5 GB |
+| features | 90 s | 1.4 GB |
+| stage 1 (5 folds + OOF scoring) | 520 s | 1.7 GB |
+| stage 2 (features + 5 folds + OOF scoring) | 158 s | 1.2 GB |
+| decision (stage-1 and stage-2 grids) | 18 s | 1.6 GB |
+| predict (test stage 1 + 2) | 98 s | 1.1 GB |
+| submit (TSVs + validator + zip) | 55 s | 0.6 GB |
+
+**Resume and failure behaviour, observed:**
+- A memory guard stopped `prune` *before* allocating, with a clear message.
+  The re-run skipped normalize and candidates in 2–3 s and reused the stage-0
+  model.
+- Same for `stage2` (training-matrix estimate).
+- After fixes, 27 checkpoints were skipped and only the missing work ran.
+- A bug in `submit` was fixed and resumed with `--from submit`.
+
+## EXP-009 · Medium scale: full target pools (memory realism for 32 GB)
+
+`EF_DEV_S1_FRAC=0.03 EF_DEV_TARGET_FRAC=1.0`: 3 % of S1 (train 66k, test 52k)
+against the **complete** S2/S3 pools (10.3M train, 10.0M test targets). Every
+per-target structure is therefore real size: records, TF-IDF matrices,
+per-target aggregates. Apple M1, 8 GB RAM, `16gb` profile, 8 threads.
+
+| stage | time | peak RSS |
+|---|---|---|
+| normalize (all 24.2M records) | 491 s | 2.52 GB |
+| candidates (5 partitions, 6 channels each) | 1320 s | 2.25 GB |
+| prune | 176 s | 1.30 GB |
+| features (9.1M pairs) | 317 s | 1.96 GB |
+
+**Realistic recall** (full distractor density; top-60 after stage-0 pruning):
+
+| | pruned union | top-10 | top-20 | top-40 | top-50 |
+|---|---|---|---|---|---|
+| India | **0.9846** | 0.9669 | 0.9783 | 0.9831 | 0.9840 |
+| US | **0.9905** | 0.9791 | 0.9869 | 0.9899 | 0.9903 |
+
+This matches the raw-union recall of EXP-005/006 (0.985 / 0.991), so stage-0
+pruning to 60 per S1 loses ≤ 0.001, and the curve is flat after ~50.
+
+**Old vs new retrieval on the full-pool India partition:** identical output
+(3,007,433 pairs; ranks, ids, cosines ≤ 1e-6). Live sparse-matrix bytes
+extrapolated to all S1 (from logged nnz):
+
+| partition | old: all 6 channels | new: 1 channel + its transpose |
+|---|---|---|
+| train/india | 2.19 GB | 1.66 GB |
+| train/us | 1.75 GB | 1.56 GB |
+| test/india | 2.50 GB | 1.94 GB |
+
+The bigger saving is after retrieval. The old union, id gathering and every
+downstream stage held O(all rows): a 121M-row partition is ~8 GB as a bare
+DataFrame (68 B/row), before join and window intermediates. The new code holds
+O(one part) (≤ 6M rows on the 32gb profile). On the 8 GB Mac the old
+retrieval took 584 s against 331 s for the new one on the same partition,
+consistent with memory-pressure slowdown. macOS compresses pages, so its RSS
+figures understate the old peak.
+
+**Throughput for planning a full run on 4 vCPU** (extrapolated, M1 → ~2× slower on 4 vCPU):
+features ≈ 35–40 µs/pair on 8 M1 cores → ~5 h for all ~236M pairs on 4 vCPU;
+retrieval is already done on the SageMaker instance (adopted).
+
+**Robustness fix found here:** an ad-hoc run reused a stale candidate scratch
+directory built for other inputs. `generate_candidates_to_file` now stores an
+input fingerprint in the scratch dir and starts fresh on mismatch (with a test).

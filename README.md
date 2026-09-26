@@ -34,7 +34,8 @@ Details: [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md). Evidence: [`docs/EXPE
 
 - Retrieval measured on real data: recall **0.985** (India) / **0.991** (US) at ~100 raw candidates per S1 (`docs/EXPERIMENTS.md`, EXP-002…006).
 - Whole pipeline verified end to end on the dev slice: all six notebooks run and the official validator passes (EXP-007).
-- **Next: full training run** on a big machine: `bash scripts/run_notebooks.sh` (see `docs/SAGEMAKER.md`). Then copy the OOF numbers from notebook 04 into `docs/METHODOLOGY.md`.
+- Pipeline is checkpointed, resumable and memory-bounded (every stage streams in parts); verified end to end on the dev slice and, with full S2/S3 pools, through features at ≤ 2.5 GB peak RSS (EXP-008, EXP-009). Realistic pruned recall: India 0.985, US 0.991.
+- **Next: full run** with `bash scripts/run_notebooks.sh` (see `docs/SAGEMAKER.md`), then copy the OOF numbers from `artifacts/reports/` into `docs/METHODOLOGY.md`.
 
 ## Repository layout
 
@@ -50,7 +51,7 @@ entity-forge/
 ├── src/entity_forge/                all logic (notebooks stay thin)
 ├── tests/                           pytest, synthetic data
 ├── utils/validate_submission.py     official validator (unchanged)
-├── scripts/run_notebooks.sh         headless runner (SageMaker / nohup)
+├── scripts/run_notebooks.sh         single entry point: run / resume / status / force
 ├── docs/                            design, experiments, methodology, SageMaker guide
 ├── dataset/                         competition data (git-ignored, read-only)
 ├── artifacts/                       generated: norm/ candidates/ features/ models/ scores/ reports/
@@ -62,21 +63,26 @@ entity-forge/
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # macOS: brew install libomp (LightGBM)
-pytest -q                                # unit tests
+pytest -q                                # unit + equivalence tests
 
 # put the competition files in dataset/train and dataset/test, then:
-EF_DEV_MODE=1 bash scripts/run_notebooks.sh   # ~2 % slice, end-to-end, laptop-sized
-bash scripts/run_notebooks.sh                 # full run (big machine, see below)
+bash scripts/run_notebooks.sh --dev      # ~2 % slice end to end (artifacts_dev/), minutes
+bash scripts/run_notebooks.sh            # full run; re-run the same command to resume
+bash scripts/run_notebooks.sh --status   # what is done / missing / stale
 ```
 
-Or open the notebooks in JupyterLab (`jupyter lab`) and run them in order.
-Every stage writes Parquet artifacts, so you can resume from any notebook or
-move between machines.
+`scripts/run_notebooks.sh` is the single entry point. It runs the stages
+`normalize → candidates → prune → features → stage1 → stage2 → decision →
+predict → submit`, each in its own process. Every finished partition, part and
+model is checkpointed and skipped on the next run, so an interrupted run
+resumes where it stopped. Useful flags: `--from STAGE`, `--to STAGE`,
+`--only STAGE[,..]`, `--force STAGE`, `--profile 16gb|32gb|64gb`,
+`--notebooks` (execute the notebooks instead; same checkpoints).
 
-**Full training** needs a big machine (64 GB+ RAM, many cores; no GPU needed).
-See [`docs/SAGEMAKER.md`](docs/SAGEMAKER.md) for a SageMaker recipe.
-All knobs live in `src/entity_forge/settings.py` and can be overridden with
-`EF_*` environment variables (e.g. `EF_N_THREADS=32`, `EF_MAX_CANDIDATES=60`).
+**Hardware:** CPU only. A memory profile picked from detected RAM bounds every
+chunk and training sample, so the same code runs on 16 GB, 32 GB (the 4-vCPU
+SageMaker reference) and 64 GB+ machines without edits. Knobs, checkpoints and
+resume rules: [`docs/SAGEMAKER.md`](docs/SAGEMAKER.md).
 
 ## Outputs
 
